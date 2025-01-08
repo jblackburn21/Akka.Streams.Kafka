@@ -36,7 +36,8 @@ namespace Akka.Streams.Kafka.Tests
         public KafkaFixture()
         {
             DockerClientConfiguration config;
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
+                RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
                 config = new DockerClientConfiguration(new Uri("unix://var/run/docker.sock"));
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 config = new DockerClientConfiguration(new Uri("npipe://./pipe/docker_engine"));

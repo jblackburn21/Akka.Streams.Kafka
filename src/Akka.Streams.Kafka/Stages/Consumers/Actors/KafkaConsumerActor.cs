@@ -43,8 +43,8 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
         private readonly TimeSpan _warningDuration;
         
         private ICancelable _pollCancellation;
-        private readonly Internal.Poll<K, V> _pollMessage;
-        private readonly Internal.Poll<K, V> _delayedPollMessage;
+        // private readonly Internal.Poll<K, V> _pollMessage;
+        // private readonly Internal.Poll<K, V> _delayedPollMessage;
 
         private TimeSpan _pollTimeout;
         
@@ -74,7 +74,7 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
         private IActorRef _connectionCheckerActor;
         private readonly ILoggingAdapter _log;
         private bool _stopInProgress = false;
-        private bool _delayedPoolInFlight = false;
+        private bool _delayedPollInFlight = false;
         private IImmutableSet<TopicPartition> _resumedPartitions = ImmutableHashSet<TopicPartition>.Empty;
         private readonly Decider _decider;
 
@@ -112,8 +112,8 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
             _restrictedConsumer = new RestrictedConsumer<K, V>(_consumer, TimeSpan.FromMilliseconds(restrictedConsumerTimeoutMs));
             _warningDuration = _settings.PartitionHandlerWarning;
             
-            _pollMessage = new Internal.Poll<K, V>(this, periodic: true);
-            _delayedPollMessage = new Internal.Poll<K, V>(this, periodic: false);
+            // _pollMessage = new Internal.Poll<K, V>(this, periodic: true);
+            // _delayedPollMessage = new Internal.Poll<K, V>(this, periodic: false);
             _log = Context.GetLogger();
         }
 
@@ -142,9 +142,13 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
         // This is RebalanceListener.OnPartitionAssigned on JVM
         private void PartitionsAssignedHandler(IImmutableSet<TopicPartition> partitions)
         {
+            var correlationId = Guid.NewGuid();
+            
+            _log.Info("[{CorrelationId}] Partitions assigned: {Partitions}", correlationId, partitions.Select(tp => tp.ToString()).JoinToString(", "));
+            
             var assignment = _consumer.Assignment;
             var partitionsToPause = partitions.Where(p => assignment.Contains(p)).ToList();
-            PausePartitions(partitionsToPause);
+            PausePartitions(correlationId, partitionsToPause);
             
             _commitRefreshing.AssignedPositions(partitions, _consumer, _settings.PositionTimeout);
 
@@ -159,19 +163,28 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
         // This is RebalanceListener.OnPartitionRevoked on JVM
         private void PartitionsRevokedHandler(IImmutableSet<TopicPartitionOffset> partitions)
         {
+            var correlationId = Guid.NewGuid();
+            
+            _log.Info("[{CorrelationId}] Partitions revoked: {Partitions}", correlationId, partitions.Select(p => p.TopicPartition.ToString()).JoinToString(", "));
+            
             var watch = Stopwatch.StartNew();
             _partitionEventHandler.OnRevoke(partitions, _restrictedConsumer);
             watch.Stop();
             CheckDuration(watch, "onRevoke");
             
             _commitRefreshing.Revoke(partitions.Select(tp => tp.TopicPartition).ToImmutableHashSet());
+            
+            // TODO: Remove requests and requestors for TopicPartitions that have been revoked
+            // _requests = ImmutableDictionary<IActorRef, KafkaConsumerActorMetadata.Internal.RequestMessages>.Empty;
+            // _requestors = ImmutableHashSet<IActorRef>.Empty;
+            
             _rebalanceInProgress = true;
         }
 
         private void RebalancePostStop()
         {
             var currentTopicPartitions = _consumer.Assignment;
-            PausePartitions(currentTopicPartitions);
+            PausePartitions(Guid.NewGuid(), currentTopicPartitions);
             
             var watch = Stopwatch.StartNew();
             _partitionEventHandler.OnStop(currentTopicPartitions.ToImmutableHashSet(), _restrictedConsumer);
@@ -183,7 +196,7 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
         {
             if (watch.Elapsed > _warningDuration)
             {
-                _log.Warning("Partition assignment handler `{0}` took longer than `partition-handler-warning`: {1} ms", method, watch.ElapsedMilliseconds);
+                _log.Warning("Partition assignment handler `{Method}` took longer than `partition-handler-warning`: {Elapsed} ms", method, watch.ElapsedMilliseconds);
             }
         }        
 
@@ -195,7 +208,7 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
             {
                 case KafkaConsumerActorMetadata.Internal.Assign assign:
                 {
-                    ScheduleFirstPoolTask();
+                    ScheduleFirstPollTask();
                     CheckOverlappingRequests("Assign", Sender, assign.TopicPartitions);
                     var previousAssigned = _consumer.Assignment;
                     _consumer.Assign(assign.TopicPartitions.Union(previousAssigned));
@@ -205,7 +218,7 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
 
                 case KafkaConsumerActorMetadata.Internal.AssignWithOffset assignWithOffset:
                 {
-                    ScheduleFirstPoolTask();
+                    ScheduleFirstPollTask();
                     var topicPartitions = assignWithOffset.TopicPartitionOffsets.Select(o => o.TopicPartition).ToImmutableHashSet();
                     CheckOverlappingRequests("AssignWithOffset", Sender, topicPartitions);
                     var previousAssigned = _consumer.Assignment.Select(tp => new TopicPartitionOffset(tp, new Offset(0)));
@@ -226,6 +239,9 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                     return true;
                 
                 case Internal.Poll<K, V> poll:
+                    
+                    _log.Info("[{CorrelationId}] Poll requested, periodic: {periodic}", poll.CorrelationId, poll.Periodic);
+                    
                     ReceivePoll(poll);
                     return true;
                 
@@ -234,6 +250,10 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                     return true;
                 
                 case KafkaConsumerActorMetadata.Internal.RequestMessages requestMessages:
+                    var correlationId = Guid.NewGuid();
+                    
+                    _log.Info("[{CorrelationId}] Messages requested from: {Sender}, for: {TopicPartitions}", correlationId, Sender, requestMessages.Topics.JoinToString(", "));
+                    
                     Context.Watch(Sender);
                     CheckOverlappingRequests("RequestMessages", Sender, requestMessages.Topics);
                     _requests = _requests.SetItem(Sender, requestMessages);
@@ -244,12 +264,16 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                     // That is done by sending a message to self, and thereby collect pending messages in mailbox.
                     if (_requestors.Count == 1)
                     {
-                        Poll();
+                        _log.Info("[{CorrelationId}] Polling for single requestor when messages requested", correlationId);
+                        Poll(correlationId);
                     }
-                    else if (!_delayedPoolInFlight)
+                    else if (!_delayedPollInFlight)
                     {
-                        _delayedPoolInFlight = true;
-                        Self.Tell(_delayedPollMessage);
+                        _delayedPollInFlight = true;
+                        // Self.Tell(_delayedPollMessage);
+                        var delayedPoll = new Internal.Poll<K, V>(this, periodic: false, correlationId: correlationId);
+                        _log.Info("[{CorrelationId}] Delayed poll when messages requested, periodic: {Periodic}", delayedPoll.CorrelationId, delayedPoll.Periodic);
+                        Self.Tell(delayedPoll);
                     }
                     return true;
                 
@@ -267,16 +291,17 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                     return true;
                 
                 case KafkaConsumerActorMetadata.Internal.Stop _:
-                    _log.Debug($"Received Stop from {Sender}, stopping");
+                    _log.Debug("Received Stop from {Sender}, stopping", Sender);
                     Context.Stop(Self);
                     return true;
                 
                 case KafkaConnectionFailed kcf:
-                    ProcessError(kcf);
+                    ProcessError(Guid.NewGuid(), kcf);
                     Self.Tell(KafkaConsumerActorMetadata.Internal.Stop.Instance);
                     return true;
 
                 case Terminated terminated:
+                    _log.Debug("Terminated requestor: {TerminatedActorRef}", terminated.ActorRef);
                     _requests = _requests.Remove(terminated.ActorRef);
                     _requestors = _requestors.Remove(terminated.ActorRef);
                     return true;
@@ -295,7 +320,7 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                     return true;
                 
                 case Status.Failure fail:
-                    ProcessExceptions(fail.Cause);
+                    ProcessExceptions(Guid.NewGuid(), fail.Cause);
                     return true;
                 
                 default:
@@ -331,9 +356,9 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
 
                 var localSelf = Self;
                 _consumer = _settings.CreateKafkaConsumer(
-                    consumeErrorHandler: (c, e) => localSelf.Tell(new Status.Failure(new KafkaException(e))),
-                    partitionAssignedHandler: (c, tp) => localSelf.Tell(new PartitionAssigned(tp.ToImmutableHashSet())),
-                    partitionRevokedHandler: (c, tp) => localSelf.Tell(new PartitionRevoked(tp.ToImmutableHashSet())),
+                    consumeErrorHandler: (_, e) => localSelf.Tell(new Status.Failure(new KafkaException(e))),
+                    partitionAssignedHandler: (_, tp) => localSelf.Tell(new PartitionAssigned(tp.ToImmutableHashSet())),
+                    partitionRevokedHandler: (_, tp) => localSelf.Tell(new PartitionRevoked(tp.ToImmutableHashSet())),
                     statisticHandler: (c, json) => _statisticsHandler.OnStatistics(c, json));
 
                 if (_settings.ConnectionCheckerSettings.Enabled)
@@ -343,7 +368,7 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
             }
             catch (Exception e)
             {
-                ProcessError(e);
+                ProcessError(Guid.NewGuid(), e);
                 throw;
             }
         }
@@ -394,11 +419,11 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                 else
                     throw new NotSupportedException($"Unsupported subscription type: {subscriptionRequest.GetType()}");
                 
-                ScheduleFirstPoolTask();
+                ScheduleFirstPollTask();
             }
             catch (Exception ex)
             {
-                ProcessError(ex);
+                ProcessError(Guid.NewGuid(), ex);
             }
         }
 
@@ -420,17 +445,24 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
             }
         }
 
-        private void ScheduleFirstPoolTask()
+        private void ScheduleFirstPollTask()
         {
             if (_pollCancellation == null || _pollCancellation.IsCancellationRequested)
-                SchedulePoolTask();
+            {
+                _log.Debug("Scheduling first poll task...");
+                SchedulePollTask();
+            }
         }
 
-        private void SchedulePoolTask()
+        private void SchedulePollTask()
         {
             _pollCancellation?.Cancel(); // Stop existing scheduling, if any
+
+            // var pm = _pollMessage;
+            var poll = new Internal.Poll<K, V>(this, periodic: true, correlationId: Guid.NewGuid());
             
-            _pollCancellation = Context.System.Scheduler.ScheduleTellOnceCancelable(_settings.PollInterval, Self, _pollMessage, Self);
+            _log.Debug("[{CorrelationId}] Scheduling poll, periodic: {Periodic}, delay: {Delay}ms...", poll.CorrelationId, poll.Periodic, _settings.PollInterval.TotalMilliseconds);
+            _pollCancellation = Context.System.Scheduler.ScheduleTellOnceCancelable(_settings.PollInterval, Self, poll, Self);
         }
 
         private void CheckOverlappingRequests(string updateType, IActorRef fromStage, IImmutableSet<TopicPartition> topics)
@@ -456,34 +488,54 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                 var refreshOffsets = _commitRefreshing.RefreshOffsets;
                 if (refreshOffsets.Any())
                 {
-                    _log.Debug($"Refreshing comitted offsets: {refreshOffsets.JoinToString(", ")}");
+                    _log.Debug("[{CorrelationId}] Refreshing committed offsets: {Offsets}", poll.CorrelationId, refreshOffsets.JoinToString(", "));
                     Commit(refreshOffsets, msg => Context.System.DeadLetters.Tell(msg));
                 }
                
-                Poll();
+                Poll(poll.CorrelationId);
                
                 if (poll.Periodic)
-                    SchedulePoolTask();
+                    SchedulePollTask();
                 else
-                    _delayedPoolInFlight = false;
+                    _delayedPollInFlight = false;
             }
             else
             {
                 // Message was enqueued before a restart - can be ignored
-                _log.Debug("Ignoring Poll message with stale target ref");
+                _log.Debug("[{CorrelationId}] Ignoring Poll message with stale target ref", poll.CorrelationId);
             }
         }
 
-        private void Poll()
+        private void Poll(Guid pollCorrelationId)
         {
             var currentAssignment = _consumer.Assignment;
             var initialRebalanceInProcess = _rebalanceInProgress;
 
+            // TODO: handle no assignments
+
+            // if (currentAssignment.IsEmpty())
+            // {
+            //     _log.Info("[{CorrelationId}] Assignment is empty - skipping poll, outstanding {RequestCount} requests", pollCorrelationId, _requests.Count);
+            //     
+            //     try
+            //     {
+            //         var consumed = _consumer.Consume(0);
+            //         if (consumed != null)
+            //             throw new IllegalActorStateException("Consumed message should be null");
+            //     }
+            //     catch (Exception e)
+            //     {
+            //         ProcessExceptions(pollCorrelationId, e);
+            //     }
+            //     
+            //     return;
+            // }
+            
             if (_requests.IsEmpty())
             {
                 if(_log.IsDebugEnabled)
-                    _log.Debug("Requests are empty - attempting to consume.");
-                PausePartitions(currentAssignment);
+                    _log.Debug("[{CorrelationId}] Requests are empty - attempting to consume", pollCorrelationId);
+                PausePartitions(pollCorrelationId, currentAssignment);
                 try
                 {
                     var consumed = _consumer.Consume(0);
@@ -492,7 +544,7 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                 }
                 catch (Exception e)
                 {
-                    ProcessExceptions(e);
+                    ProcessExceptions(pollCorrelationId, e);
                 }
             }
             else
@@ -505,36 +557,43 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                     try
                     {
                         if(_log.IsDebugEnabled)
-                            _log.Debug("Seeking offset {0} in partition {1} for topic {2}", tpo.Offset, tpo.Partition, tpo.Topic);
+                            _log.Debug("[{CorrelationId}] Seeking offset {Topic}[{Partition}][{Offset}]", pollCorrelationId, tpo.Topic, tpo.Partition, tpo.Offset);
                         _consumer.Seek(tpo);
                     }
                     catch (Exception ex)
                     {
-                        _log.Error(ex, $"{tpo.TopicPartition} Failed to seek to {tpo.Offset}: {ex}");
+                        _log.Error(ex, "{TopicPartition} Failed to seek to {Offset}: {Msg}", tpo.TopicPartition, tpo.Offset, ex.Message);
                         throw;
                     }
                 }
+                
+                _log.Info("[{CorrelationId}] Starting poll with rebalancing: {Rebalancing}, {RequestCount} requests: {Requests}, {AssignmentCount} assignments: {Assignments}",
+                    pollCorrelationId, _rebalanceInProgress, _requests.Count, _requests.SelectMany(r => r.Value.Topics).Select(tp => tp.ToString()).JoinToString(", "),
+                    _consumer.Assignment.Count, _consumer.Assignment.Select(tp => tp.ToString()).JoinToString(", "));
                 
                 // resume partitions to fetch
                 IImmutableSet<TopicPartition> partitionsToFetch = _requests.Values.SelectMany(v => v.Topics).ToImmutableHashSet();
                 var resumeThese = currentAssignment.Where(partitionsToFetch.Contains).ToList();
                 var pauseThese = currentAssignment.Except(resumeThese).ToList();
-                PausePartitions(pauseThese);
-                ResumePartitions(resumeThese);
+                PausePartitions(pollCorrelationId, pauseThese);
+                ResumePartitions(pollCorrelationId, resumeThese);
 
                 using (var cts = new CancellationTokenSource(_settings.PollTimeout))
                 {
                     var (polled, exception) = PollKafka(cts.Token);
                     try
                     {
-                        ProcessResult(partitionsToFetch, polled);
+                        _log.Info("[{CorrelationId}] Processing {polled.Count} records, {AssignmentCount} assignments: {Assignments}",
+                            pollCorrelationId, polled.Count, _consumer.Assignment.Count, _consumer.Assignment.Select(tp => tp.ToString()).JoinToString(", "));
+                        
+                        ProcessResult(pollCorrelationId, partitionsToFetch, polled);
                     }
                     catch (Exception e)
                     {
-                        ProcessExceptions(e);
+                        ProcessExceptions(pollCorrelationId, e);
                     }
 
-                    ProcessExceptions(exception);
+                    ProcessExceptions(pollCorrelationId, exception);
                 }
             }
             
@@ -547,25 +606,25 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
             }
         }
 
-        private void ProcessExceptions(Exception exception)
+        private void ProcessExceptions(Guid pollCorrelationId, Exception exception)
         {
             if (exception == null)
                 return;
 
             var directive = _decider(exception);
-            ProcessError(exception);
+            ProcessError(pollCorrelationId, exception);
             if (directive == Directive.Resume)
                 return;
             
-            _pollCancellation?.Cancel();
+             _pollCancellation?.Cancel();
             if(directive == Directive.Stop && _log.IsErrorEnabled)
-                _log.Error(exception, "Exception when polling from consumer, stopping actor: {0}", exception.Message);
+                _log.Error(exception, "[{CorrelationId}] Exception when polling from consumer, KafkaConsumerActor actor: {0}", pollCorrelationId, exception.Message);
             Context.Stop(Self);
         }
 
         private (List<ConsumeResult<K, V>>, Exception) PollKafka(CancellationToken token)
         {
-            ConsumeResult<K, V> consumed = null;
+            ConsumeResult<K, V> consumed;
             var i = 10; // 10 poll attempts
             var timeout = Math.Max((int) _pollTimeout.TotalMilliseconds / i, 1);
             var polled = new List<ConsumeResult<K, V>>();
@@ -588,10 +647,10 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
             return (polled, null);
         }
 
-        private void ProcessResult(IImmutableSet<TopicPartition> partitionsToFetch, List<ConsumeResult<K,V>> rawResult)
+        private void ProcessResult(Guid pollCorrelationId, IImmutableSet<TopicPartition> partitionsToFetch, List<ConsumeResult<K,V>> rawResult)
         {
             if(_log.IsDebugEnabled)
-                _log.Debug("Processing poll result with {0} records", rawResult.Count);
+                _log.Debug("[{CorrelationId}] Processing poll result with {RecordCount} records", pollCorrelationId, rawResult.Count);
             if(rawResult.IsEmpty())
                 return;
 
@@ -600,7 +659,7 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                 throw new ArgumentException(
                     $"Unexpected records polled. Expected: [{string.Join(", ", partitionsToFetch.Select(p => p.ToString()))}], " +
                     $"result: [{string.Join(", ", fetchedTps.Select(p => p.ToString()))}], " +
-                    $"consumer assignment: [{string.Join(", ", _consumer.Assignment.Select(p => p.ToString()))}]");
+                    $"consumer assignment: [{_consumer.Assignment.Select(tp => tp.ToString()).JoinToString(", ")}]");
                     
             //send messages to actors
             foreach (var (stageActorRef, request) in _requests.ToTuples())
@@ -625,16 +684,18 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                 }
                 if(!messages.IsEmpty())
                 {
+                    _log.Info("[{CorrelationId}] Sending {MessageCount} messages to: {StageActorRef} for: {TopicPartition}", pollCorrelationId, messages.Count, stageActorRef, messages.First().TopicPartition);
+                    
                     stageActorRef.Tell(new KafkaConsumerActorMetadata.Internal.Messages<K, V>(request.RequestId, messages.ToImmutableList()));
                     _requests = _requests.Remove(stageActorRef);
                 }
             }                    
         }
         
-        private void ProcessError(Exception error)
+        private void ProcessError(Guid pollCorrelationId, Exception error)
         {
             var involvedStageActors = _requests.Keys.Append(_owner).ToImmutableHashSet();
-            _log.Debug($"Sending failure to {involvedStageActors.JoinToString(", ")}. Error: {error}");
+            _log.Info("[{CorrelationId}] Sending failure to {InvolvedStageActors}. Error: {Error}", pollCorrelationId, involvedStageActors.JoinToString(", "), error.Message);
             foreach (var actor in involvedStageActors)
             {
                 actor.Tell(new Status.Failure(error));
@@ -656,7 +717,7 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                     _log.Warning($"Kafka commit took longer than `commit-time-warning`: {watch.ElapsedMilliseconds} ms");
 
                 Self.Tell(new KafkaConsumerActorMetadata.Internal.Committed(commitMap));
-                sendReply(Akka.Done.Instance);
+                sendReply(Done.Instance);
             }
             catch (Exception ex)
             {
@@ -668,12 +729,17 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
             // That is done by sending a message to self, and thereby collect pending messages in mailbox.
             if (_requestors.Count == 1)
             {
-                Poll();
+                var correlationId = Guid.NewGuid();
+                _log.Debug("[{CorrelationId}] Polling for single requestor after commit...", correlationId);
+                Poll(Guid.NewGuid());
             }
-            else if (!_delayedPoolInFlight)
+            else if (!_delayedPollInFlight)
             {
-                _delayedPoolInFlight = true;
-                Self.Tell(_delayedPollMessage);
+                _delayedPollInFlight = true;
+                // Self.Tell(_delayedPollMessage);
+                var delayedPoll = new Internal.Poll<K, V>(this, periodic: false, correlationId: Guid.NewGuid());
+                _log.Debug("[{CorrelationId}] Delayed poll after commit, periodic: {Periodic}", delayedPoll.CorrelationId, delayedPoll.Periodic);
+                Self.Tell(delayedPoll);
             }
         }
 
@@ -692,19 +758,21 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
             }
         }
 
-        private void PausePartitions(List<TopicPartition> partitions)
+        private void PausePartitions(Guid pollCorrelationId, List<TopicPartition> partitions)
         {
-            if(_log.IsDebugEnabled)
-                _log.Debug("Pausing partitions [{0}]", string.Join(",", partitions));
+            // if(_log.IsDebugEnabled)
+            if(!partitions.IsEmpty())
+                _log.Info("[{CorrelationId}] Pausing partitions [{Partitions}]", pollCorrelationId, partitions.JoinToString(", "));
             _consumer.Pause(partitions);
             _resumedPartitions = _resumedPartitions.Except(partitions);
         }
 
-        private void ResumePartitions(List<TopicPartition> partitions)
+        private void ResumePartitions(Guid pollCorrelationId, List<TopicPartition> partitions)
         {
             var partitionsToResume = partitions.Except(_resumedPartitions).ToList();
-            if(_log.IsDebugEnabled)
-                _log.Debug("Resuming partitions [{0}]", string.Join(",", partitionsToResume));
+            // if(_log.IsDebugEnabled)
+            if(!partitionsToResume.IsEmpty())
+                _log.Info("[{CorrelationId}] Resuming partitions [{Partitions}]", pollCorrelationId, partitionsToResume.JoinToString(", "));
             _consumer.Resume(partitionsToResume);
             _resumedPartitions = _resumedPartitions.Union(partitionsToResume);
         }
@@ -715,14 +783,16 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Actors
                 where TPollKey : K
                 where TPollValue : V
             {
-                public Poll(KafkaConsumerActor<TPollKey, TPollValue> target, bool periodic)
+                public Poll(KafkaConsumerActor<TPollKey, TPollValue> target, bool periodic, Guid correlationId)
                 {
                     Target = target;
                     Periodic = periodic;
+                    CorrelationId = correlationId;
                 }
 
                 public KafkaConsumerActor<TPollKey, TPollValue> Target { get; }
                 public bool Periodic { get; }
+                public Guid CorrelationId { get; }
             }
         }
 

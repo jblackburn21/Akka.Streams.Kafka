@@ -272,7 +272,7 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Abstract
         {
             _partitionsToRevoke = _partitionsToRevoke.Union(revoked.Select(r => r.TopicPartition));
 
-            ScheduleOnce(new CloseRevokedPartitions(), _settings.WaitClosePartition);
+            ScheduleOnce(new CloseRevokedPartitions(), _settings.WaitClosePartition); // default: 500ms
         }
 
         private void HandleSubsourceCancelled((TopicPartition, ISubSourceCancellationStrategy) obj)
@@ -517,7 +517,7 @@ namespace Akka.Streams.Kafka.Stages.Consumers.Abstract
                 public override void PreStart()
                 {
                     base.PreStart();
-                    Log.Debug("{0} Starting SubSource for partition {1}", _actorNumber, _topicPartition);
+                    Log.Debug("#{0} Starting SubSource for partition {1}", _actorNumber, _topicPartition);
 
                     _subSourceActor = GetStageActor(MessageHandling());
                     _subSourceActor.Watch(_consumerActor);
